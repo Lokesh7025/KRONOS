@@ -86,7 +86,7 @@ def preprocess_and_health_score(df, current_day, manual_inputs):
 
 # --- 4. THE OPTIMIZER ---
 def solve_daily_optimization(fleet_df, current_day, scenario="NORMAL"):
-    # (This function is now correct and does not need changes)
+
     model = cp_model.CpModel()
     modifiers = SCENARIO_MODIFIERS[scenario]
     is_in_service = {r['train_id']: model.NewBoolVar(f"s_{r['train_id']}") for _, r in fleet_df.iterrows()}
@@ -149,7 +149,7 @@ def solve_daily_optimization(fleet_df, current_day, scenario="NORMAL"):
 
 # --- 5. SIMULATION ENGINE ---
 def apply_daily_updates(df, plan, current_day):
-    # (This function is now correct and does not need changes)
+
     service_trains = plan['SERVICE']
     maintenance_trains = plan['MAINTENANCE']
     today = SIMULATION_START_DATE + timedelta(days=current_day - 1)
@@ -176,7 +176,7 @@ def apply_daily_updates(df, plan, current_day):
 
 # --- 6. MAIN SIMULATION LOOP ---
 if __name__ == "__main__":
-    # (This loop is correct and does not need changes)
+
     for day in range(1, SIMULATION_MONTH_DAYS + 1):
         scenario = MONTHLY_SCENARIOS[day - 1]
         manual_inputs_today = MANUAL_INPUTS_CALENDAR.get(day, {})
