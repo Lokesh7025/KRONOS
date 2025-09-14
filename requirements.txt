@@ -1,2 +1,4 @@
-pandas
-ortools
+pandas==2.2.2
+ortools==9.10.4067
+scikit-learn==1.5.0
+joblib==1.4.2
