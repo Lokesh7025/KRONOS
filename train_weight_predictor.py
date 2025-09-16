@@ -16,8 +16,7 @@ except FileNotFoundError:
     print(f"Error: '{HISTORICAL_DATA_FILE}' not found. Please ensure the file exists.")
     exit()
 
-# The model needs to learn which weights produce the HIGHEST success score.
-# We will only train it on the best historical data (e.g., days with success > 80).
+# Filter for successful strategies to learn from the best outcomes
 df_successful = df[df['success_score'] > 80].copy()
 print(f"Filtered for successful strategies: {len(df_successful)} data points.")
 
@@ -29,11 +28,13 @@ features = [
     'is_monsoon',
     'is_surge'
 ]
-# The model will learn to predict all of these weights at once
+# The model will now predict all 5 of these strategic parameters
 targets = [
     'historical_cost_per_km',
     'historical_fatigue_factor',
-    'historical_branding_penalty'
+    'historical_branding_penalty',
+    'historical_target_mileage',
+    'historical_maint_threshold'
 ]
 
 X = df_successful[features]
@@ -42,10 +43,9 @@ y = df_successful[targets]
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
 # --- 3. Train the AI "Strategist" Model ---
-print("\nTraining the AI Strategist model...")
+print("\nTraining the AI Strategist model to predict 5 strategic parameters...")
 
-# We use a base model (RandomForest) and wrap it in MultiOutputRegressor
-# to allow it to predict multiple target values simultaneously.
+# The MultiOutputRegressor is perfect for this task
 base_model = RandomForestRegressor(n_estimators=100, random_state=42)
 multi_output_model = MultiOutputRegressor(estimator=base_model)
 
