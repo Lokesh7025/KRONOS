@@ -9,11 +9,9 @@ import joblib
 SIMULATION_START_DATE = datetime(2025, 9, 1)
 SIMULATION_MONTH_DAYS = 30
 DAILY_KM_PER_TRAIN = 200
-TARGET_MONTHLY_KM = 1400 
 DAILY_HOURS_PER_TRAIN = 16
-HEALTH_SCORE_MAINTENANCE_THRESHOLD = 50
-BOGIE_SERVICE_INTERVAL_KM = 25000
 CERTIFICATE_VALIDITY_DAYS = 365
+# Note: Core strategy parameters like target mileage and health threshold are now predicted by the AI
 
 # --- LOAD THE AI STRATEGIST MODEL ---
 try:
@@ -26,23 +24,21 @@ except FileNotFoundError:
 # Scenario calendars
 MANUAL_INPUTS_CALENDAR = {
     5: {"Rake-12": {"health_penalty": 40, "reason": "Visual inspection"}},
-    15: {"Rake-19": {"force_maintenance": True, "reason": "Driver report"}},
-    20: {"Rake-16": {"force_maintenance": True, "reason": "HVAC Leak"}},
-    25: {"Rake-01": {"force_maintenance": True, "reason": "PIS Failure"}}
+    15: {"Rake-19": {"force_maintenance": True, "reason": "Driver report"}}
 }
-MONTHLY_SCENARIOS = ['NORMAL'] * SIMULATION_MONTH_DAYS
+MONTHLY_SCENARIOS = ['NORMAL'] * 30
 MONTHLY_SCENARIOS[6] = MONTHLY_SCENARIOS[7] = 'FESTIVAL_SURGE'
 MONTHLY_SCENARIOS[12] = MONTHLY_SCENARIOS[13] = 'HEAVY_MONSOON'
 MONTHLY_SCENARIOS[21] = 'FESTIVAL_SURGE'
 
-# --- 2. FIXED COSTS AND MODIFIERS (Tuned for 25 trains) ---
+# --- 2. FIXED COSTS AND MODIFIERS ---
 MAINTENANCE_SLOT_PENALTY = 1000000
 SERVICE_SHORTFALL_PENALTY = 5000000
-BASE_SHUNT_COST = 400 
+BASE_SHUNT_COST = 400
 SCENARIO_MODIFIERS = {
-    "NORMAL": {"MIN_SERVICE": 18, "MAX_SERVICE": 20, "MAINTENANCE_SLOTS": 2},
-    "HEAVY_MONSOON": {"MIN_SERVICE": 18, "MAX_SERVICE": 20, "MAINTENANCE_SLOTS": 2, "WEATHER_PENALTY_OLD_BRAKES": 15000, "WEATHER_PENALTY_BOGIE_WEAR": 20000},
-    "FESTIVAL_SURGE": {"MIN_SERVICE": 20, "MAX_SERVICE": 22, "MAINTENANCE_SLOTS": 1}
+    "NORMAL": {"MIN_SERVICE": 6, "MAX_SERVICE": 6, "MAINTENANCE_SLOTS": 2},
+    "HEAVY_MONSOON": {"MIN_SERVICE": 6, "MAX_SERVICE": 6, "MAINTENANCE_SLOTS": 2, "WEATHER_PENALTY_OLD_BRAKES": 15000},
+    "FESTIVAL_SURGE": {"MIN_SERVICE": 7, "MAX_SERVICE": 8, "MAINTENANCE_SLOTS": 1}
 }
 
 # --- 3. HELPER FUNCTIONS ---
@@ -70,9 +66,16 @@ def preprocess_and_health_score(df, current_day, manual_inputs):
     return df
 
 # --- 4. THE AI-DRIVEN OPTIMIZER ---
-def solve_daily_optimization(fleet_df, current_day, scenario, dynamic_costs={}):
+def solve_daily_optimization(fleet_df, current_day, scenario, dynamic_strategy={}):
     model = cp_model.CpModel()
     modifiers = SCENARIO_MODIFIERS[scenario]
+    
+    FATIGUE_PENALTY_FACTOR = dynamic_strategy.get('fatigue_factor', 500)
+    PER_KM_DEVIATION_COST = dynamic_strategy.get('cost_per_km', 5)
+    BRANDING_SLA_PENALTY = dynamic_strategy.get('branding_penalty', 50000)
+    TARGET_MONTHLY_KM = dynamic_strategy.get('target_mileage', 1400)
+    HEALTH_SCORE_MAINTENANCE_THRESHOLD = dynamic_strategy.get('maint_threshold', 50)
+    
     is_in_service = {r['train_id']: model.NewBoolVar(f"s_{r['train_id']}") for _, r in fleet_df.iterrows()}
     is_in_maintenance = {r['train_id']: model.NewBoolVar(f"m_{r['train_id']}") for _, r in fleet_df.iterrows()}
     is_on_standby = {r['train_id']: model.NewBoolVar(f"b_{r['train_id']}") for _, r in fleet_df.iterrows()}
@@ -81,8 +84,12 @@ def solve_daily_optimization(fleet_df, current_day, scenario, dynamic_costs={}):
         tid = row['train_id']
         model.Add(is_in_service[tid] + is_in_maintenance[tid] + is_on_standby[tid] == 1)
         if row['is_cert_expired'] or row['job_card_priority'] == 'CRITICAL': model.Add(is_in_service[tid] == 0)
-        if row['health_score'] < HEALTH_SCORE_MAINTENANCE_THRESHOLD or row['manual_force_maintenance']:
+        
+        # --- THIS IS THE CRITICAL CHANGE ---
+        # A train MUST be maintained if health is low, it's manually flagged, OR its certificate is expired.
+        if row['health_score'] < HEALTH_SCORE_MAINTENANCE_THRESHOLD or row['manual_force_maintenance'] or row['is_cert_expired']:
             model.Add(is_in_maintenance[tid] == 1)
+            
     model.Add(sum(is_in_service.values()) <= modifiers['MAX_SERVICE'])
     
     total_objective = []
@@ -96,10 +103,6 @@ def solve_daily_optimization(fleet_df, current_day, scenario, dynamic_costs={}):
     abs_maint_dev = model.NewIntVar(0, len(fleet_df), 'abs_maint_dev')
     model.AddAbsEquality(abs_maint_dev, maint_dev)
     total_objective.append(abs_maint_dev * MAINTENANCE_SLOT_PENALTY)
-    
-    FATIGUE_PENALTY_FACTOR = dynamic_costs.get('fatigue_factor', 500)
-    PER_KM_DEVIATION_COST = dynamic_costs.get('cost_per_km', 5)
-    BRANDING_SLA_PENALTY = dynamic_costs.get('branding_penalty', 50000)
 
     for _, row in fleet_df.iterrows():
         tid, service_var = row['train_id'], is_in_service[row['train_id']]
@@ -116,7 +119,6 @@ def solve_daily_optimization(fleet_df, current_day, scenario, dynamic_costs={}):
         service_cost += int(row['stabling_shunt_moves'] * BASE_SHUNT_COST)
         if scenario == "HEAVY_MONSOON":
             if row['brake_model'] == 'HydroMech_v1': service_cost += modifiers['WEATHER_PENALTY_OLD_BRAKES']
-            if row['km_since_last_service'] > BOGIE_SERVICE_INTERVAL_KM: service_cost += modifiers['WEATHER_PENALTY_BOGIE_WEAR']
         
         total_objective.append(service_cost * service_var)
         total_objective.append(int(row['health_score']) * is_in_maintenance[tid])
@@ -159,6 +161,7 @@ def apply_daily_updates(df, plan, current_day):
         if current_expiry < today:
             new_expiry_date = today + timedelta(days=CERTIFICATE_VALIDITY_DAYS)
             df.loc[train_index, 'cert_telecom_expiry'] = new_expiry_date
+            print(f"    INFO: Certificate for {train_id} renewed to {new_expiry_date.strftime('%Y-%m-%d')}")
     df.loc[df['train_id'].isin(maintenance_trains), 'health_score'] = 100
     df.loc[df['train_id'].isin(maintenance_trains), 'bogie_last_service_km'] = df.loc[df['train_id'].isin(maintenance_trains), 'current_km']
     if 'total_service_days_month' not in df.columns: df['total_service_days_month'] = 0
@@ -169,7 +172,9 @@ def apply_daily_updates(df, plan, current_day):
 
 # --- 6. MAIN SIMULATION LOOP ---
 if __name__ == "__main__":
-    if AI_STRATEGIST_MODEL is None: sys.exit(1)
+    if AI_STRATEGIST_MODEL is None:
+        sys.exit(1)
+
     for day in range(1, SIMULATION_MONTH_DAYS + 1):
         scenario = MONTHLY_SCENARIOS[day - 1]
         manual_inputs_today = MANUAL_INPUTS_CALENDAR.get(day, {})
@@ -181,21 +186,26 @@ if __name__ == "__main__":
             
         fleet_df = preprocess_and_health_score(fleet_df, day, manual_inputs_today)
 
-        current_conditions = pd.DataFrame([{
+        current_conditions = {
             'total_fleet_size': len(fleet_df),
             'target_service_trains': SCENARIO_MODIFIERS[scenario]['MIN_SERVICE'],
             'avg_fleet_health': fleet_df['health_score'].mean(),
             'is_monsoon': 1 if scenario == 'HEAVY_MONSOON' else 0,
             'is_surge': 1 if scenario == 'FESTIVAL_SURGE' else 0
-        }])
-        
-        predicted_weights = AI_STRATEGIST_MODEL.predict(current_conditions)[0]
-        dynamic_costs = {
-            'cost_per_km': predicted_weights[0], 'fatigue_factor': predicted_weights[1], 'branding_penalty': predicted_weights[2]
         }
-        print(f"AI Strategist recommends weights for today: cost_per_km={dynamic_costs['cost_per_km']:.2f}, fatigue_factor={dynamic_costs['fatigue_factor']:.2f}, branding_penalty={dynamic_costs['branding_penalty']:.2f}")
+        conditions_df = pd.DataFrame([current_conditions])
+        
+        predicted_strategy = AI_STRATEGIST_MODEL.predict(conditions_df)[0]
+        dynamic_strategy = {
+            'cost_per_km': predicted_strategy[0],
+            'fatigue_factor': predicted_strategy[1],
+            'branding_penalty': predicted_strategy[2],
+            'target_mileage': predicted_strategy[3],
+            'maint_threshold': predicted_strategy[4]
+        }
+        print(f"AI Strategist recommends for today: Target KM={dynamic_strategy['target_mileage']:.0f}, Maint. Threshold={dynamic_strategy['maint_threshold']:.0f}")
 
-        daily_plan, daily_cost = solve_daily_optimization(fleet_df, day, scenario, dynamic_costs)
+        daily_plan, daily_cost = solve_daily_optimization(fleet_df, day, scenario, dynamic_strategy)
         
         if daily_plan:
             print("Optimal plan generated for tomorrow:")
