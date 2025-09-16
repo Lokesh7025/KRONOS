@@ -5,13 +5,13 @@ import sys
 import time
 import joblib
 import json
+
 # --- 1. SIMULATION CONFIGURATION ---
 SIMULATION_START_DATE = datetime(2025, 9, 1)
 SIMULATION_MONTH_DAYS = 30
 DAILY_KM_PER_TRAIN = 200
 DAILY_HOURS_PER_TRAIN = 16
 CERTIFICATE_VALIDITY_DAYS = 365
-LOG_FILE_NAME = "monthly_simulation_log.csv"
 JSON_LOG_FILE = "simulation_log.json"
 
 # --- LOAD THE AI STRATEGIST MODEL ---
@@ -49,6 +49,7 @@ def get_fleet_data(file_path="fleet_status.csv"):
 
 def preprocess_and_health_score(df, current_day, manual_inputs):
     df['cert_telecom_expiry'] = pd.to_datetime(df['cert_telecom_expiry'])
+    df['last_cleaned_date'] = pd.to_datetime(df['last_cleaned_date'])
     today = SIMULATION_START_DATE + timedelta(days=current_day - 1)
     df['is_cert_expired'] = df['cert_telecom_expiry'] < today
     df['health_score'] = 100.0
@@ -70,26 +71,21 @@ def preprocess_and_health_score(df, current_day, manual_inputs):
 def solve_daily_optimization(fleet_df, current_day, scenario, dynamic_strategy={}):
     model = cp_model.CpModel()
     modifiers = SCENARIO_MODIFIERS[scenario]
-    
     FATIGUE_PENALTY_FACTOR = dynamic_strategy.get('fatigue_factor', 500)
     PER_KM_DEVIATION_COST = dynamic_strategy.get('cost_per_km', 5)
     BRANDING_SLA_PENALTY = dynamic_strategy.get('branding_penalty', 50000)
     TARGET_MONTHLY_KM = dynamic_strategy.get('target_mileage', 1400)
     HEALTH_SCORE_MAINTENANCE_THRESHOLD = dynamic_strategy.get('maint_threshold', 50)
-    
     is_in_service = {r['train_id']: model.NewBoolVar(f"s_{r['train_id']}") for _, r in fleet_df.iterrows()}
     is_in_maintenance = {r['train_id']: model.NewBoolVar(f"m_{r['train_id']}") for _, r in fleet_df.iterrows()}
     is_on_standby = {r['train_id']: model.NewBoolVar(f"b_{r['train_id']}") for _, r in fleet_df.iterrows()}
-    
     for _, row in fleet_df.iterrows():
         tid = row['train_id']
         model.Add(is_in_service[tid] + is_in_maintenance[tid] + is_on_standby[tid] == 1)
         if row['is_cert_expired'] or row['job_card_priority'] == 'CRITICAL': model.Add(is_in_service[tid] == 0)
         if row['health_score'] < HEALTH_SCORE_MAINTENANCE_THRESHOLD or row['manual_force_maintenance'] or row['is_cert_expired']:
             model.Add(is_in_maintenance[tid] == 1)
-            
     model.Add(sum(is_in_service.values()) <= modifiers['MAX_SERVICE'])
-    
     total_objective = []
     num_in_service = sum(is_in_service.values())
     shortfall = model.NewIntVar(0, modifiers['MIN_SERVICE'], 'shortfall')
@@ -101,38 +97,30 @@ def solve_daily_optimization(fleet_df, current_day, scenario, dynamic_strategy={
     abs_maint_dev = model.NewIntVar(0, len(fleet_df), 'abs_maint_dev')
     model.AddAbsEquality(abs_maint_dev, maint_dev)
     total_objective.append(abs_maint_dev * MAINTENANCE_SLOT_PENALTY)
-
     for _, row in fleet_df.iterrows():
         tid, service_var = row['train_id'], is_in_service[row['train_id']]
-        
         consecutive_days = row.get('consecutive_service_days', 0)
         fatigue_cost = int((consecutive_days**2) * FATIGUE_PENALTY_FACTOR)
         service_cost = fatigue_cost
-        
         ideal_km = (TARGET_MONTHLY_KM / SIMULATION_MONTH_DAYS) * current_day
         urgency_multiplier = current_day / SIMULATION_MONTH_DAYS
         mileage_cost = int(abs(row['current_km'] - ideal_km) * PER_KM_DEVIATION_COST * urgency_multiplier)
         service_cost += mileage_cost
-        
         service_cost += int(row['stabling_shunt_moves'] * BASE_SHUNT_COST)
         if scenario == "HEAVY_MONSOON":
             if row['brake_model'] == 'HydroMech_v1': service_cost += modifiers['WEATHER_PENALTY_OLD_BRAKES']
-        
         total_objective.append(service_cost * service_var)
         total_objective.append(int(row['health_score']) * is_in_maintenance[tid])
-        
         if row['branding_sla_active']:
-            hours_needed = row['target_hours'] - row['current_hours']
+            hours_needed = row.get('target_hours', 0) - row.get('current_hours', 0)
             if hours_needed > 0:
                 run_rate = hours_needed / (SIMULATION_MONTH_DAYS - current_day + 1)
                 urgency = run_rate / DAILY_HOURS_PER_TRAIN
                 penalty = int(BRANDING_SLA_PENALTY * urgency)
                 total_objective.append(penalty * (1 - service_var))
-
     model.Minimize(sum(total_objective))
     solver = cp_model.CpSolver()
     status = solver.Solve(model)
-    
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         plan = {'SERVICE': [], 'MAINTENANCE': [], 'STANDBY': []}
         for _, r in fleet_df.iterrows():
@@ -170,9 +158,8 @@ def apply_daily_updates(df, plan, current_day):
 # --- 6. MAIN SIMULATION LOOP ---
 if __name__ == "__main__":
     if AI_STRATEGIST_MODEL is None: sys.exit(1)
+    
     full_log = []
-    # Clear the log file at the start of a new simulation
-    open(LOG_FILE_NAME, 'w').close()
 
     for day in range(1, SIMULATION_MONTH_DAYS + 1):
         scenario = MONTHLY_SCENARIOS[day - 1]
@@ -185,7 +172,6 @@ if __name__ == "__main__":
             
         fleet_df = preprocess_and_health_score(fleet_df, day, manual_inputs_today)
 
-        # AI STRATEGIST IN ACTION
         current_conditions = {'total_fleet_size': len(fleet_df), 'target_service_trains': SCENARIO_MODIFIERS[scenario]['MIN_SERVICE'], 'avg_fleet_health': fleet_df['health_score'].mean(), 'is_monsoon': 1 if scenario == 'HEAVY_MONSOON' else 0, 'is_surge': 1 if scenario == 'FESTIVAL_SURGE' else 0}
         conditions_df = pd.DataFrame([current_conditions])
         predicted_strategy = AI_STRATEGIST_MODEL.predict(conditions_df)[0]
@@ -203,25 +189,27 @@ if __name__ == "__main__":
             for category, trains in daily_plan.items():
                 print(f"  - {category} ({len(trains)}): {sorted(trains)}")
             
-            updated_df = apply_daily_updates(fleet_df, daily_plan, day)
+            updated_df = apply_daily_updates(fleet_df.copy(), daily_plan, day)
             updated_df.to_csv("fleet_status.csv", index=False)
             
-            log_df = updated_df.copy()
-            log_df['simulation_day'] = day
-            log_df['status'] = 'STANDBY'
-            log_df.loc[log_df['train_id'].isin(daily_plan['SERVICE']), 'status'] = 'SERVICE'
-            log_df.loc[log_df['train_id'].isin(daily_plan['MAINTENANCE']), 'status'] = 'MAINTENANCE'
+            # --- THIS IS THE CORRECTED LOGGING LOGIC ---
+            fleet_df_for_log = fleet_df.copy()
+            fleet_df_for_log['cert_telecom_expiry'] = fleet_df_for_log['cert_telecom_expiry'].dt.strftime('%Y-%m-%d')
+            fleet_df_for_log['last_cleaned_date'] = fleet_df_for_log['last_cleaned_date'].dt.strftime('%Y-%m-%d')
 
-            if day == 1:
-                log_df.to_csv(LOG_FILE_NAME, mode='w', header=True, index=False)
-            else:
-                log_df.to_csv(LOG_FILE_NAME, mode='a', header=False, index=False)
+            daily_log_entry = {
+                "day": day,
+                "scenario": scenario,
+                "plan": daily_plan,
+                "fleet_status_today": fleet_df_for_log.to_dict(orient='records')
+            }
+            full_log.append(daily_log_entry)
+            # --- END OF CORRECTED LOGGING LOGIC ---
         else:
             print(f"CRITICAL FAILURE on Day {day}. Halting simulation.")
             break
         time.sleep(0.1)
-
-    print(f"\n{'='*25} END OF MONTH SIMULATION COMPLETE {'='*25}")
+    
     # Save the complete log to a JSON file at the end
     with open(JSON_LOG_FILE, 'w') as f:
         json.dump(full_log, f, indent=2)
