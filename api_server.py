@@ -5,6 +5,7 @@ import os
 from dotenv import load_dotenv
 import google.generativeai as genai
 from datetime import datetime, timedelta
+import re # Import the regular expression module
 
 # --- Configuration ---
 load_dotenv()
@@ -25,22 +26,41 @@ model = genai.GenerativeModel('gemini-1.5-flash')
 app = Flask(__name__)
 CORS(app)  # Allow requests from your React frontend
 
-# --- Helper Function to get context ---
+# --- Helper Functions ---
+
+def extract_day_from_question(question, default_day=15):
+    """
+    Parses a question to find a specific day number.
+    e.g., "what happened on day 13" -> 13
+    """
+    match = re.search(r'day\s+(\d+)', question, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return default_day
+
 def get_context_for_query(log_df, day, train_ids):
     """
-    Finds the relevant rows in the log file to provide as context.
+    Finds the relevant rows and creates a rich summary for the AI.
     """
     context_df = log_df[(log_df['simulation_day'] == day) & (log_df['train_id'].isin(train_ids))]
     if context_df.empty:
         return "No data found for the specified trains on that day.", ""
     
-    # Create a simple summary string for each train
+    # Create a detailed summary string for each train to help the AI understand "why"
     context_summary = ""
     for _, row in context_df.iterrows():
-        if row['branding_sla_active']:
-            context_summary += f"\n- {row['train_id']} has an active SLA. Target: {row['target_hours']} hours, Current: {row['current_hours']} hours."
-        else:
-            context_summary += f"\n- {row['train_id']} does not have an active SLA."
+        status = row.get('status', 'N/A')
+        health = row.get('health_score', 'N/A')
+        fatigue = row.get('consecutive_service_days', 0)
+        
+        context_summary += f"\n- On Day {day}, {row['train_id']} was assigned to: **{status}**."
+        context_summary += f"  - Its health score was {health:.1f}."
+        if status == 'SERVICE':
+             context_summary += f" It had been in service for {fatigue} consecutive day(s)."
+        if status == 'MAINTENANCE':
+            context_summary += " It was likely sent for maintenance because its health was low or it was manually flagged."
+        if status == 'STANDBY':
+            context_summary += " It was likely on standby because it was not needed for service or was less optimal than other trains."
 
     return context_df.to_string(index=False), context_summary
 
@@ -49,7 +69,6 @@ def get_context_for_query(log_df, day, train_ids):
 def ask_rake_assist():
     data = request.json
     user_question = data.get('question')
-    simulation_day = data.get('day', 15) 
 
     if not user_question:
         return jsonify({"error": "No question provided."}), 400
@@ -59,23 +78,22 @@ def ask_rake_assist():
     except FileNotFoundError:
         return jsonify({"error": f"Log file '{LOG_FILE}' not found."}), 500
 
+    # NEW: Extract the day from the question
+    simulation_day = extract_day_from_question(user_question)
+    
     mentioned_train_ids = [word for word in user_question.replace(",", " ").split() if 'Rake-' in word]
     if not mentioned_train_ids:
-        # If no specific train is mentioned, we can't get context yet.
-        # A more advanced version could handle general questions.
         return jsonify({"answer": "Please mention a specific train ID (e.g., Rake-03) in your question."})
 
-    
     context_data, context_summary = get_context_for_query(log_df, simulation_day, mentioned_train_ids)
     days_remaining = SIMULATION_MONTH_DAYS - simulation_day + 1
 
     # --- This is the new, much smarter prompt ---
     prompt = f"""
-    You are RakeAssist, an expert AI co-pilot for the Kochi Metro operations supervisor. Your role is to answer questions concisely, accurately, and helpfully, using ONLY the data provided below as your context. Do not make up information.
+    You are RakeAssist, an expert AI co-pilot for the Kochi Metro operations supervisor. Your role is to answer questions concisely, accurately, and helpfully, using ONLY the data provided below as your context. Your primary task is to explain the "why" behind a decision.
 
     **Current Simulation Parameters:**
     - Today is Day {simulation_day} of a {SIMULATION_MONTH_DAYS}-day month.
-    - There are {days_remaining} days remaining in the month.
     - A train in service runs for approximately {DAILY_HOURS_PER_TRAIN} hours per day.
 
     **Context Data for Day {simulation_day}:**
@@ -83,15 +101,15 @@ def ask_rake_assist():
     {context_data}
     ---
     
-    **Summary:**
+    **Summary of Assignments:**
     {context_summary}
 
     **Analysis Task:**
-    Based on the supervisor's question, analyze the provided data. 
-    To determine if a train is "on pace" for its branding SLA, calculate the required hours it needs to run on every remaining day.
-    Required Run Rate = (target_hours - current_hours) / days_remaining.
-    If the Required Run Rate is greater than {DAILY_HOURS_PER_TRAIN}, the train is behind schedule.
-    If the user asks about a train with no SLA, state that clearly and politely.
+    Based on the supervisor's question, analyze the provided data to explain WHY a train had a specific assignment.
+    - If a train is in MAINTENANCE, it's because its health score was very low or it was manually flagged.
+    - If a train is on STANDBY, it means it was a less optimal choice for service that day compared to other trains, likely due to higher fatigue, lower health, or other risk factors.
+    - If a train is in SERVICE, it was one of the most cost-effective and healthy options available.
+    Use the summary to state the assignment, then use the detailed context data to find the reason.
 
     **Supervisor's Question:** "{user_question}"
 
@@ -99,15 +117,8 @@ def ask_rake_assist():
     """
 
     try:
-        print("--- Sending Prompt to Gemini ---")
-        # print(prompt) # Uncomment for debugging
-        print("---------------------------------")
-        
         response = model.generate_content(prompt)
         ai_answer = response.text
-        
-        print(f"Gemini Response: {ai_answer}")
-        
         return jsonify({"answer": ai_answer})
     except Exception as e:
         print(f"Error calling Gemini API: {e}")
