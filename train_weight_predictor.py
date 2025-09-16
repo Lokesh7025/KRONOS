@@ -1,68 +1,59 @@
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error
+from sklearn.multioutput import MultiOutputRegressor
 import joblib
 
 # --- 1. Configuration ---
 HISTORICAL_DATA_FILE = "historical_data_retrain.csv"
-MODEL_OUTPUT_FILE = "weight_predictor_model.joblib"
+MODEL_OUTPUT_FILE = "strategy_model.joblib"
 
 # --- 2. Load and Prepare Data ---
-print(f"Loading historical data from '{HISTORICAL_DATA_FILE}'...")
+print(f"Loading historical strategy data from '{HISTORICAL_DATA_FILE}'...")
 try:
     df = pd.read_csv(HISTORICAL_DATA_FILE)
 except FileNotFoundError:
-    print(f"Error: The historical data file '{HISTORICAL_DATA_FILE}' was not found.")
-    print("Please ensure you have created this file with the correct data.")
+    print(f"Error: '{HISTORICAL_DATA_FILE}' not found. Please ensure the file exists.")
     exit()
 
-print("Data loaded successfully.")
+# The model needs to learn which weights produce the HIGHEST success score.
+# We will only train it on the best historical data (e.g., days with success > 80).
+df_successful = df[df['success_score'] > 80].copy()
+print(f"Filtered for successful strategies: {len(df_successful)} data points.")
 
-# Define the features (inputs) and the target (output) for the model
+# Define the features (inputs) and the targets (multiple outputs)
 features = [
-    'health_score_start_of_day',
-    'km_since_last_service',
-    'consecutive_service_days',
-    'was_heavy_rain',
-    'was_high_demand',
-    'brake_model_HydroMech_v1'
+    'total_fleet_size',
+    'target_service_trains',
+    'avg_fleet_health',
+    'is_monsoon',
+    'is_surge'
 ]
-target = 'true_operational_risk_score'
+# The model will learn to predict all of these weights at once
+targets = [
+    'historical_cost_per_km',
+    'historical_fatigue_factor',
+    'historical_branding_penalty'
+]
 
-X = df[features]
-y = df[target]
+X = df_successful[features]
+y = df_successful[targets]
 
-# Split data into a training set (to teach the model) and a testing set ( to evaluate it)
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-print(f"Data split into {len(X_train)} training samples and {len(X_test)} testing samples.")
+# --- 3. Train the AI "Strategist" Model ---
+print("\nTraining the AI Strategist model...")
 
-# --- 3. Train the AI Model ---
-print("\nTraining the AI Weight Predictor model (RandomForestRegressor)...")
+# We use a base model (RandomForest) and wrap it in MultiOutputRegressor
+# to allow it to predict multiple target values simultaneously.
+base_model = RandomForestRegressor(n_estimators=100, random_state=42)
+multi_output_model = MultiOutputRegressor(estimator=base_model)
 
-# We use a RandomForestRegressor because we are predicting a continuous value (the risk score)
-# n_estimators=100 is a good starting point, random_state ensures we get the same result each time
-model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+multi_output_model.fit(X_train, y_train)
+print("AI Strategist training complete.")
 
-# Teach the model the patterns in the training data
-model.fit(X_train, y_train)
-
-print("Model training complete.")
-
-# --- 4. Evaluate Model Performance ---
-print("\nEvaluating model performance on unseen test data...")
-predictions = model.predict(X_test)
-mae = mean_absolute_error(y_test, predictions)
-
-print(f"Mean Absolute Error (MAE): {mae:.2f}")
-print("  (This means, on average, the model's risk score prediction is off by this amount.)")
-print("  (A lower MAE is better.)")
-
-
-# --- 5. Save the Trained Model ---
-print(f"\nSaving the trained model to '{MODEL_OUTPUT_FILE}'...")
-joblib.dump(model, MODEL_OUTPUT_FILE)
+# --- 4. Save the Trained Model ---
+print(f"\nSaving the trained strategist model to '{MODEL_OUTPUT_FILE}'...")
+joblib.dump(multi_output_model, MODEL_OUTPUT_FILE)
 print("Model saved successfully.")
-print("\nYou can now run the main 'run_simulation.py' script, which will use this new AI model.")
 
